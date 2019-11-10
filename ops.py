@@ -189,7 +189,7 @@ class MultilayerPerceptron(tf.keras.Model):
         if self.light:
             x = self.gap(x_init)
         else:
-            x = self.flatten(x)
+            x = self.flatten(x_init)
         x = self.dense1(x)
         x = self.dense2(x)
         gamma = self.dense_g(x)
