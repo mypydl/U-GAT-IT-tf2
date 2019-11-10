@@ -10,4 +10,4 @@ datasets: horse2zebra
 
 暂时还没跑完全部epoch
 
-代码与1.x版本略有不同
+模型结构与1.x版本略有不同
