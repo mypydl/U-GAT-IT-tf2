@@ -4,8 +4,35 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import tensorflow as tf
-from tensorflow.keras import constraints, layers, losses, optimizers
+from tensorflow.keras import constraints, layers, losses, optimizers, Sequential
 import matplotlib.pyplot as plt
+
+
+class InstanceNormalization(tf.keras.layers.Layer):
+    """Instance Normalization Layer (https://arxiv.org/abs/1607.08022)."""
+    def __init__(self, epsilon=1e-5):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def build(self, input_shape):
+        self.scale = self.add_weight(
+            name='scale',
+            shape=input_shape[-1:],
+            # initializer=tf.constant_initializer(0.01),
+            initializer=tf.random_normal_initializer(0., 0.02),
+            trainable=True)
+
+        self.offset = self.add_weight(
+            name='offset',
+            shape=input_shape[-1:],
+            initializer='zeros',
+            trainable=True)
+
+    def call(self, x):
+        mean, variance = tf.nn.moments(x, axes=[1, 2], keepdims=True)
+        inv = tf.math.rsqrt(variance + self.epsilon)
+        normalized = (x - mean) * inv
+        return self.scale * normalized + self.offset
 
 
 class AdaInsLayerNorm(layers.Layer):
@@ -17,7 +44,7 @@ class AdaInsLayerNorm(layers.Layer):
         self.rho = self.add_weight(
             name='rho',
             shape=input_shape[-1],
-            initializer=tf.constant_initializer(1.0),
+            initializer=tf.constant_initializer(0.9),
             trainable=True,
             constraint=constraints.MinMaxNorm(0.0, 1.0))
 
@@ -41,7 +68,7 @@ class LayerInsNorm(layers.Layer):
         self.rho = self.add_weight(
             name='rho',
             shape=input_shape[-1],
-            initializer=tf.constant_initializer(1.0),
+            initializer=tf.constant_initializer(0.9),
             trainable=True,
             constraint=constraints.MinMaxNorm(0.0, 1.0))
         self.gamma = self.add_weight(
@@ -75,13 +102,14 @@ class FullyConnectedWithWeight(tf.keras.layers.Layer):
         self.weight = self.add_weight(
             name='weight',
             shape=[input_shape[-1], 1],
-            initializer=tf.random_normal_initializer,
+            # initializer=tf.constant_initializer(0.01),
+            initializer=tf.random_normal_initializer(0.0, 0.02),
             regularizer=tf.keras.regularizers.l2(0.0001),
             trainable=True)
         self.bias = self.add_weight(
             name='bias',
             shape=[1],
-            initializer=tf.constant_initializer(0.0),
+            initializer='zero',
             trainable=True)
 
     def call(self, x):
@@ -97,6 +125,7 @@ class FullyConnectedWithWeight(tf.keras.layers.Layer):
 def conv(filters, kernel, strides, padding='same', use_bias=True):
     return tf.keras.layers.Conv2D(
         filters, kernel, strides, padding=padding, use_bias=use_bias,
+        # kernel_initializer=tf.constant_initializer(0.01),
         kernel_initializer=tf.random_normal_initializer(0., 0.02),
         kernel_regularizer=tf.keras.regularizers.l2(0.0001))
 
@@ -105,6 +134,7 @@ def dconv(filters, kernel, strides, padding='same', use_bias=True):
     return tf.keras.layers.Conv2DTranspose(
         filters, kernel, strides, padding=padding, use_bias=use_bias,
         activation='tanh',
+        # kernel_initializer=tf.constant_initializer(0.01),
         kernel_initializer=tf.random_normal_initializer(0., 0.02),
         kernel_regularizer=tf.keras.regularizers.l2(0.0001))
 
@@ -116,12 +146,12 @@ class DownSample(tf.keras.Model):
         self.conv = conv(filters, size, strides, use_bias=use_bias)
         self.relu_type = relu_type
         self.apply_norm = apply_norm
-        self.bn = tf.keras.layers.BatchNormalization()
+        self.i_n = InstanceNormalization()
 
-    def call(self, inputs):
-        x = self.conv(inputs)
+    def call(self, x_init):
+        x = self.conv(x_init)
         if self.apply_norm:
-            x = self.bn(x)
+            x = self.i_n(x)
         if self.relu_type.lower() == 'relu':
             return tf.nn.relu(x)
         elif self.relu_type.lower() == 'lrelu':
@@ -136,8 +166,8 @@ class UpSample(tf.keras.Model):
         self.dconv = dconv(filters, size, strides, use_bias=use_bias)
         self.lin = LayerInsNorm()
 
-    def call(self, inputs):
-        x = self.dconv(inputs)
+    def call(self, x_init):
+        x = self.dconv(x_init)
         x = self.lin(x)
         return tf.nn.relu(x)
 
@@ -146,14 +176,12 @@ class ResidualNetwork(tf.keras.Model):
     def __init__(self, filters, use_bias=True):
         super().__init__()
         self.part1 = DownSample(filters, 3, 1, use_bias=use_bias)
-        self.conv2 = conv(filters, 3, 1, use_bias=use_bias)
-        self.in2 = layers.BatchNormalization()
+        self.part2 = DownSample(filters, 3, 1, relu_type='none', use_bias=use_bias)
 
-    def call(self, inputs):
-        x = self.part1(inputs)
-        x = self.conv2(x)
-        x = self.in2(x)
-        return x + inputs
+    def call(self, x_init):
+        x = self.part1(x_init)
+        x = self.part2(x)
+        return x + x_init
 
 
 class AdaILResblock(tf.keras.Model):
@@ -164,7 +192,7 @@ class AdaILResblock(tf.keras.Model):
         self.conv2 = conv(filters, 3, 1, use_bias=use_bias)
         self.adailn2 = AdaInsLayerNorm()
     
-    def call(self, gamma, beta, x_init):
+    def call(self, x_init, gamma, beta):
         x = self.conv1(x_init)
         x = self.adailn1(x, gamma, beta)
         x = tf.nn.relu(x)
@@ -236,7 +264,7 @@ def plot_images(test_images, models):
     to_zebra, _, _ = models[0](test_images[0])
     to_horse, _, _ = models[1](test_images[1])
     plt.figure(figsize=(10, 10))
-    contrast = 8
+    contrast = 1
     images = [test_images[0], to_zebra, test_images[1], to_horse]
     title = ['Horse', 'To Zebra', 'Zebra', 'To Horse']
     for i in range(len(images)):
