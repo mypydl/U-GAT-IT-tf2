@@ -1,4 +1,4 @@
-from CycleGan.try_2.ops import *
+from ops import *
 import tensorflow as tf
 import tensorflow_datasets as tfds
 from datetime import datetime
@@ -9,25 +9,25 @@ class Generator(tf.keras.Model):
     def __init__(self, filters=64, n_res=4, smoothing=True, light=True,
                  use_bias=True):
         super().__init__()
-        self.filters = filters
         self.smoothing = smoothing
-        self.light = light
         self.use_bias = use_bias
 
         self.down_stack = [
-            DownSample(self.filters, 7, 1),
-            DownSample(self.filters * 2, 3, 2),
-            DownSample(self.filters * 4, 3, 2),
-            DownSample(self.filters * 4, 1, 1, apply_norm=False)]
-        self.res_stack = [ResidualNetwork(self.filters * 4)] * n_res
+            DownSample(filters, 7, 1),
+            DownSample(filters * 2, 3, 2),
+            DownSample(filters * 4, 3, 2),
+            DownSample(filters * 4, 1, 1, apply_norm=False)]
+        self.res_stack = [ResidualNetwork(filters * 4)] * n_res
         self.gap = tf.keras.layers.GlobalAveragePooling2D()
         self.gmp = tf.keras.layers.GlobalMaxPool2D()
         self.fully_connected_with_w = FullyConnectedWithWeight()
-        self.mlp = MultilayerPerceptron(self.filters * 4, light, use_bias)
-        self.ada_IL_resblock = [AdaILResblock(self.filters * 4)] * n_res
+        self.mlp = MultilayerPerceptron(filters * 4, light, use_bias)
+        self.dense_g = tf.keras.layers.Dense(filters * 4, use_bias=use_bias)
+        self.dense_b = tf.keras.layers.Dense(filters * 4, use_bias=use_bias)
+        self.ada_IL_resblock = [AdaILResblock(filters * 4)] * n_res
         self.up_stack = [
-            UpSample(self.filters * 2, 3, 2, 'layernorm'),
-            UpSample(self.filters, 3, 2, 'layernorm')]
+            UpSample(filters * 2, 3, 2),
+            UpSample(filters, 3, 2)]
         self.dconv = dconv(3, 7, 1)
 
     def call(self, x_init):
@@ -66,7 +66,7 @@ class Generator(tf.keras.Model):
 
         # Up-Sampling Bottleneck
         for res in self.ada_IL_resblock:
-            x = res(gamma, beta, x)
+            x = res(x, gamma, beta)
 
         # Up-Sample
         for i in range(2):
@@ -78,18 +78,16 @@ class Generator(tf.keras.Model):
 
 
 class SubDiscriminator(tf.keras.Model):
-    def __init__(self, filters, n_dis=4, d_type='global'):
+    def __init__(self, filters, n_dis=4):
         super().__init__()
-        if d_type.lower() == 'local':
-            n_dis -= 2
         self.down_stack = [
-            DownSample(filters * 2**i, 4, 2, 'lrelu', False) for i in range(n_dis - 1)
-        ] + [DownSample(filters * 2**(n_dis - 1), 4, 1, 'lrelu', False)]
+            DownSample(filters*2**i, 4, 2, 'lrelu', False) for i in range(n_dis-1)
+        ] + [DownSample(filters*2**(n_dis-1), 4, 1, 'lrelu', False)]
         self.fully_connected_with_w = FullyConnectedWithWeight()
         self.gap = tf.keras.layers.GlobalAveragePooling2D()
         self.gmp = tf.keras.layers.GlobalMaxPool2D()
         self.last = [
-            DownSample(filters * 2**(n_dis - 1), 1, 1, 'lrelu', False),
+            DownSample(filters*2**(n_dis-1), 1, 1, 'lrelu', False),
             DownSample(1, 4, 1, 'none', False)
         ]
 
@@ -118,8 +116,8 @@ class SubDiscriminator(tf.keras.Model):
 class Discriminator(tf.keras.Model):
     def __init__(self, filters=64, n_dis=4):
         super().__init__()
-        self.Local = SubDiscriminator(filters, n_dis, 'local')
-        self.Global = SubDiscriminator(filters, n_dis, 'global')
+        self.Local = SubDiscriminator(filters, n_dis-2)
+        self.Global = SubDiscriminator(filters, n_dis)
 
     def call(self, inputs):
         D_logit = []
@@ -142,15 +140,16 @@ class UGATIT:
         self.n_res = 4                              # args.n_res
         self.n_dis = 4                              # args.n_dis
         self.epochs = 200                           # args.epochs
-        self.init_lr = 0.0001                       # args.init_lr
+        self.init_lr = 0.001                        # args.init_lr
         self.decay_flag = True                      # args.decay_flag
         self.decay_epoch = 100                      # args.decay_epoch
+        self.step = 1000
 
         # weight
         self.gan_weight = 1                         # args.gan_weight
         self.cycle_weight = 10                      # args.cycle_weight
-        self.identity_weight = 100                  # args.identity_weight
-        self.cam_weight = 1000                      # args.cam_weight
+        self.identity_weight = 10                  # args.identity_weight
+        self.cam_weight = 100                      # args.cam_weight
         self.ld = 1                                 # args.GP_ld
         self.smoothing = True                       # args.smoothing
 
@@ -164,16 +163,14 @@ class UGATIT:
         self.iter_zebra = None
 
         # models
-        self.gen_a2b = Generator(self.filters, self.n_res, self.smoothing)
-        self.gen_b2a = Generator(self.filters, self.n_res, self.smoothing)
+        self.gen_a2b = Generator(self.filters, self.n_res, self.smoothing, self.light)
+        self.gen_b2a = Generator(self.filters, self.n_res, self.smoothing, self.light)
         self.dis_a = Discriminator(self.filters, self.n_dis)
         self.dis_b = Discriminator(self.filters, self.n_dis)
 
         # optimizers
-        self.opt_gen_a2b = optimizers.Adam(2e-4, beta_1=0.5)
-        self.opt_gen_b2a = optimizers.Adam(2e-4, beta_1=0.5)
-        self.opt_dis_a = optimizers.Adam(2e-4, beta_1=0.5)
-        self.opt_dis_b = optimizers.Adam(2e-4, beta_1=0.5)
+        self.G_optim = optimizers.Adam(self.init_lr, beta_1=0.5, epsilon=0.1)
+        self.D_optim = optimizers.Adam(self.init_lr, beta_1=0.5, epsilon=0.1)
 
         # checkpoint
         self.ckpt_path = "./checkpoints/horse2zebra"     # args.ckpt_path
@@ -183,12 +180,9 @@ class UGATIT:
             generator_b2A=self.gen_b2a,
             discriminator_a=self.dis_a,
             discriminator_b=self.dis_b,
-            generator_a2b_optimizer=self.opt_gen_a2b,
-            generator_b2a_optimizer=self.opt_gen_b2a,
-            discriminator_a_optimizer=self.opt_dis_a,
-            discriminator_b_optimizer=self.opt_dis_b)
-        self.ckpt_manager = tf.train.CheckpointManager(
-            self.ckpt, self.ckpt_path, max_to_keep=5)
+            generator_optimizer=self.G_optim,
+            discriminator_optimizer=self.D_optim)
+        self.ckpt_manager = tf.train.CheckpointManager(self.ckpt, self.ckpt_path, max_to_keep=5)
 
         # summary
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -199,29 +193,25 @@ class UGATIT:
         self.load()
 
     @tf.function
-    def train_step(self, domain_A, domain_B):
+    def train_step(self, domain_A, domain_B, step):
         with tf.GradientTape(persistent=True) as tape:
             """ Define Generator, Discriminator """
-            x_ab, cam_ab, _ = self.gen_a2b(domain_A)
-            x_ba, cam_ba, _ = self.gen_b2a(domain_B)
-            x_aba, _, _ = self.gen_b2a(x_ab)
-            x_bab, _, _ = self.gen_a2b(x_ba)
-            x_aa, cam_aa, _ = self.gen_b2a(domain_A)
-            x_bb, cam_bb, _ = self.gen_a2b(domain_B)
-            real_A_logit, real_A_cam_logit, _, _ = self.dis_a(domain_A)
-            real_B_logit, real_B_cam_logit, _, _ = self.dis_b(domain_B)
-            fake_A_logit, fake_A_cam_logit, _, _ = self.dis_b(x_ba)
-            fake_B_logit, fake_B_cam_logit, _, _ = self.dis_a(x_ab)
+            x_ab, cam_ab, _ = self.gen_a2b(domain_A, training=True)
+            x_ba, cam_ba, _ = self.gen_b2a(domain_B, training=True)
+            x_aba, _, _ = self.gen_b2a(x_ab, training=True)
+            x_bab, _, _ = self.gen_a2b(x_ba, training=True)
+            x_aa, cam_aa, _ = self.gen_b2a(domain_A, training=True)
+            x_bb, cam_bb, _ = self.gen_a2b(domain_B, training=True)
+            real_A_logit, real_A_cam_logit, _, _ = self.dis_a(domain_A, training=True)
+            real_B_logit, real_B_cam_logit, _, _ = self.dis_b(domain_B, training=True)
+            fake_A_logit, fake_A_cam_logit, _, _ = self.dis_b(x_ba, training=True)
+            fake_B_logit, fake_B_cam_logit, _, _ = self.dis_a(x_ab, training=True)
 
             """ Define Loss """
-            G_ad_loss_A = generator_loss(fake_A_logit) + \
-                generator_loss(fake_A_cam_logit)
-            G_ad_loss_B = generator_loss(fake_B_logit) + \
-                generator_loss(fake_B_cam_logit)
-            D_ad_loss_A = discriminator_loss(real_A_logit, fake_A_logit) + \
-                discriminator_loss(real_A_cam_logit, fake_A_cam_logit)
-            D_ad_loss_B = discriminator_loss(real_B_logit, fake_B_logit) + \
-                discriminator_loss(real_B_cam_logit, fake_B_cam_logit)
+            G_ad_loss_A = generator_loss(fake_A_logit) + generator_loss(fake_A_cam_logit)
+            G_ad_loss_B = generator_loss(fake_B_logit) + generator_loss(fake_B_cam_logit)
+            D_ad_loss_A = discriminator_loss(real_A_logit, fake_A_logit) + discriminator_loss(real_A_cam_logit, fake_A_cam_logit)
+            D_ad_loss_B = discriminator_loss(real_B_logit, fake_B_logit) + discriminator_loss(real_B_cam_logit, fake_B_cam_logit)
             reconstruction_A = L1_loss(x_aba, domain_A)
             reconstruction_B = L1_loss(x_bab, domain_B)
             identity_A = L1_loss(x_aa, domain_A)
@@ -236,95 +226,72 @@ class UGATIT:
             Generator_B_cycle = self.cycle_weight * reconstruction_A
             Generator_B_identity = self.identity_weight * identity_B
             Generator_B_cam = self.cam_weight * cam_B
-            Generator_A_loss = Generator_A_gan + Generator_A_cycle + \
-                Generator_A_identity + Generator_A_cam
-            Generator_B_loss = Generator_B_gan + Generator_B_cycle + \
-                Generator_B_identity + Generator_B_cam
+            Generator_A_loss = Generator_A_gan + Generator_A_cycle + Generator_A_identity + Generator_A_cam
+            Generator_B_loss = Generator_B_gan + Generator_B_cycle + Generator_B_identity + Generator_B_cam
             Discriminator_A_loss = self.gan_weight * D_ad_loss_A
             Discriminator_B_loss = self.gan_weight * D_ad_loss_B
             Generator_loss = Generator_A_loss + Generator_B_loss
             Discriminator_loss = Discriminator_A_loss + Discriminator_B_loss
 
-            """ Summary """
-            tf.summary.scalar("Generator_loss", Generator_loss)
-            tf.summary.scalar("Discriminator_loss", Discriminator_loss)
-            tf.summary.scalar("G_A_loss", Generator_A_loss)
-            tf.summary.scalar("G_A_gan", Generator_A_gan)
-            tf.summary.scalar("G_A_cycle", Generator_A_cycle)
-            tf.summary.scalar("G_A_identity", Generator_A_identity)
-            tf.summary.scalar("G_A_cam", Generator_A_cam)
-            tf.summary.scalar("G_B_loss", Generator_B_loss)
-            tf.summary.scalar("G_B_gan", Generator_B_gan)
-            tf.summary.scalar("G_B_cycle", Generator_B_cycle)
-            tf.summary.scalar("G_B_identity", Generator_B_identity)
-            tf.summary.scalar("G_B_cam", Generator_B_cam)
-            tf.summary.scalar("D_A_loss", Discriminator_A_loss)
-            tf.summary.scalar("D_B_loss", Discriminator_B_loss)
-            # self.rho_var = []
-            # for var in tf.trainable_variables():
-            #     if 'rho' in var.name:
-            #         self.rho_var.append(tf.summary.histogram(var.name, var))
-            #         self.rho_var.append(tf.summary.scalar(var.name + "_min", tf.reduce_min(var)))
-            #         self.rho_var.append(tf.summary.scalar(var.name + "_max", tf.reduce_max(var)))
-            #         self.rho_var.append(tf.summary.scalar(var.name + "_mean", tf.reduce_mean(var)))
-            # g_summary_list = [self.G_A_loss, self.G_A_gan, self.G_A_cycle, self.G_A_identity, self.G_A_cam,
-            #                   self.G_B_loss, self.G_B_gan, self.G_B_cycle, self.G_B_identity, self.G_B_cam,
-            #                   self.all_G_loss]
-            # g_summary_list.extend(self.rho_var)
-            # d_summary_list = [self.D_A_loss, self.D_B_loss, self.all_D_loss]
-            # self.G_loss = tf.summary.merge(g_summary_list)
-            # self.D_loss = tf.summary.merge(d_summary_list)
-
         """ Training """
-        grad_dis_a = tape.gradient(Discriminator_A_loss, self.dis_a.trainable_variables)
-        grad_dis_b = tape.gradient(Discriminator_B_loss, self.dis_b.trainable_variables)
-        grad_gen_a = tape.gradient(Generator_A_loss, self.gen_a2b.trainable_variables)
-        grad_gen_b = tape.gradient(Generator_B_loss, self.gen_b2a.trainable_variables)
-        self.opt_dis_a.apply_gradients(zip(grad_dis_a, self.dis_a.trainable_variables))
-        self.opt_dis_b.apply_gradients(zip(grad_dis_b, self.dis_b.trainable_variables))
-        self.opt_gen_a2b.apply_gradients(zip(grad_gen_a, self.gen_a2b.trainable_variables))
-        self.opt_gen_b2a.apply_gradients(zip(grad_gen_b, self.gen_b2a.trainable_variables))
+        grad_gen_a = tape.gradient(Generator_loss, self.gen_a2b.trainable_variables)
+        grad_gen_b = tape.gradient(Generator_loss, self.gen_b2a.trainable_variables)
+        grad_dis_a = tape.gradient(Discriminator_loss, self.dis_a.trainable_variables)
+        grad_dis_b = tape.gradient(Discriminator_loss, self.dis_b.trainable_variables)
+        self.G_optim.apply_gradients(zip(grad_gen_a, self.gen_a2b.trainable_variables))
+        self.G_optim.apply_gradients(zip(grad_gen_b, self.gen_b2a.trainable_variables))
+        self.D_optim.apply_gradients(zip(grad_dis_a, self.dis_a.trainable_variables))
+        self.D_optim.apply_gradients(zip(grad_dis_b, self.dis_b.trainable_variables))
+
+        """ Summary """
+        with self.writer.as_default():
+            tf.summary.scalar("Generator_loss", Generator_loss, step)
+            tf.summary.scalar("Discriminator_loss", Discriminator_loss, step)
+            tf.summary.scalar("G_A_0_loss", Generator_A_loss, step)
+            tf.summary.scalar("G_A_1_gan", Generator_A_gan, step)
+            tf.summary.scalar("G_A_2_cycle", Generator_A_cycle, step)
+            tf.summary.scalar("G_A_3_identity", Generator_A_identity, step)
+            tf.summary.scalar("G_A_4_cam", Generator_A_cam, step)
+            tf.summary.scalar("G_B_0_loss", Generator_B_loss, step)
+            tf.summary.scalar("G_B_1_gan", Generator_B_gan, step)
+            tf.summary.scalar("G_B_2_cycle", Generator_B_cycle, step)
+            tf.summary.scalar("G_B_3_identity", Generator_B_identity, step)
+            tf.summary.scalar("G_B_4_cam", Generator_B_cam, step)
+            tf.summary.scalar("D_A_loss", Discriminator_A_loss, step)
+            tf.summary.scalar("D_B_loss", Discriminator_B_loss, step)
+            self.writer.flush()
 
     def train(self):
-        # plot_images([next(self.iter_horse), next(self.iter_zebra)], [self.gen_a2b, self.gen_b2a])
+        plot_images([next(self.iter_horse), next(self.iter_zebra)], [self.gen_a2b, self.gen_b2a])
         for epoch in range(self.ckpt.already_step.numpy(), self.epochs):
             start = time.time()
             n = 0
-            # 启用高级分析器, 隐式启用图收集,会导致高内存开销。
-            # tf.summary.trace_on(graph=True, profiler=True)
-            tf.summary.trace_on(graph=True)
-            for horse, zebra in tf.data.Dataset.zip((self.train_horses,
-                                                     self.train_zebras)):
-                self.train_step(horse, zebra)
+            for horse, zebra in tf.data.Dataset.zip((self.train_horses, self.train_zebras)):
+                # tf.summary.trace_on(graph=True)
+                self.train_step(horse, zebra, tf.constant(epoch*self.step+n, dtype=tf.int64))
+                # with self.writer.as_default():
+                #     tf.summary.trace_export('U-GAT-IT', epoch*self.step+n, self.log_dir)
+                #     self.writer.flush()
                 if n % 20 == 0:
                     print('.', end='')
                 n += 1
-            with self.writer.as_default():
-                tf.summary.trace_export('cyclegan', 0, self.log_dir)
-                self.writer.flush()
             if (epoch + 1) % 3 == 0:
                 self.ckpt.already_step.assign_add(3)
                 ckpt_save_path = self.ckpt_manager.save()
-                print('Saved ckpt for epoch {} at {}'.format(epoch + 1,
-                                                             ckpt_save_path))
-            plot_images([next(self.iter_horse), next(self.iter_zebra)],
-                        [self.gen_a2b, self.gen_b2a])
+                print('Saved ckpt for epoch {} at {}'.format(epoch + 1, ckpt_save_path))
+            plot_images([next(self.iter_horse), next(self.iter_zebra)], [self.gen_a2b, self.gen_b2a])
             print('Epoch {} took {}s'.format(epoch + 1, time.time() - start))
 
     def load(self):
-        dataset, _ = tfds.load(self.data_dir, with_info=True,
-                               as_supervised=True)
+        dataset, info = tfds.load(self.data_dir, with_info=True, as_supervised=True)
+        self.step = info.splits['trainA'].num_examples
         train_horses, train_zebras = dataset['trainA'], dataset['trainB']
         test_horses, test_zebras = dataset['testA'], dataset['testB']
         AUTOTUNE = tf.data.experimental.AUTOTUNE
-        self.train_horses = train_horses.map(
-            preprocess_image_train, AUTOTUNE).shuffle(1000).batch(1)
-        self.train_zebras = train_zebras.map(
-            preprocess_image_train, AUTOTUNE).shuffle(1000).batch(1)
-        self.test_horses = test_horses.map(
-            normalize, AUTOTUNE).shuffle(1000).batch(1)
-        self.test_zebras = test_zebras.map(
-            normalize, AUTOTUNE).shuffle(1000).batch(1)
+        self.train_horses = train_horses.map(preprocess_image_train, AUTOTUNE).shuffle(1000).batch(1)
+        self.train_zebras = train_zebras.map(preprocess_image_train, AUTOTUNE).shuffle(1000).batch(1)
+        self.test_horses = test_horses.map(normalize, AUTOTUNE).shuffle(1000).batch(1)
+        self.test_zebras = test_zebras.map(normalize, AUTOTUNE).shuffle(1000).batch(1)
         self.iter_horse = iter(self.test_horses)
         self.iter_zebra = iter(self.test_zebras)
         print("[*] Reading checkpoints...")
