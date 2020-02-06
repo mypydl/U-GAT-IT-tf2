@@ -8,8 +8,7 @@ tensorflow-datasets1.2.0
 
 datasets: horse2zebra
 
-暂时还没跑完全部epoch
+模型结构基本上和原light版相同，但只做了gan，没有做wgan/drgan等的拓展
 
-模型结构与原版略有不同
-
-效果不怎么样
+用GPU跑消耗的显存未知，用CPU跑占用12G内存
+没跑完，不知道效果
