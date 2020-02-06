@@ -1,25 +1,20 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-
 import tensorflow as tf
-from tensorflow.keras import constraints, layers, losses, optimizers, Sequential
-import matplotlib.pyplot as plt
+from tensorflow import keras
+
+weight_initializer = tf.random_normal_initializer(0., 0.02)
+weight_regularizer = keras.regularizers.l2(0.0002)
 
 
-class InstanceNormalization(tf.keras.layers.Layer):
-    """Instance Normalization Layer (https://arxiv.org/abs/1607.08022)."""
-    def __init__(self, epsilon=1e-5):
-        super().__init__()
+class InstanceNormalization(keras.layers.Layer):
+    def __init__(self, epsilon=1e-5, name=None):
+        super(InstanceNormalization, self).__init__(name=name)
         self.epsilon = epsilon
 
     def build(self, input_shape):
         self.scale = self.add_weight(
             name='scale',
             shape=input_shape[-1:],
-            # initializer=tf.constant_initializer(0.01),
-            initializer=tf.random_normal_initializer(0., 0.02),
+            initializer=weight_initializer,
             trainable=True)
 
         self.offset = self.add_weight(
@@ -35,42 +30,40 @@ class InstanceNormalization(tf.keras.layers.Layer):
         return self.scale * normalized + self.offset
 
 
-class AdaInsLayerNorm(layers.Layer):
-    def __init__(self, epsilon=1e-5):
-        super().__init__()
+class AdaInsLayerNorm(keras.layers.Layer):
+    def __init__(self, epsilon=1e-5, name=None):
+        super(AdaInsLayerNorm, self).__init__(name=name)
         self.epsilon = epsilon
 
     def build(self, input_shape):
         self.rho = self.add_weight(
             name='rho',
             shape=input_shape[-1],
-            initializer=tf.constant_initializer(0.9),
+            initializer=tf.constant_initializer(1.0),
             trainable=True,
-            constraint=constraints.MinMaxNorm(0.0, 1.0))
+            constraint=keras.constraints.MinMaxNorm(0.0, 1.0))
 
     def call(self, x, gamma, beta):
         ins_mean, ins_sigma = tf.nn.moments(x, axes=[1, 2], keepdims=True)
         x_ins = (x - ins_mean) / (tf.sqrt(ins_sigma + self.epsilon))
-
         ln_mean, ln_sigma = tf.nn.moments(x, axes=[1, 2, 3], keepdims=True)
         x_ln = (x - ln_mean) / (tf.sqrt(ln_sigma + self.epsilon))
-
         x_hat = self.rho * x_ins + (1 - self.rho) * x_ln
         return x_hat * gamma + beta
 
 
-class LayerInsNorm(layers.Layer):
-    def __init__(self):
-        super().__init__()
+class LayerInsNorm(keras.layers.Layer):
+    def __init__(self, name=None):
+        super(LayerInsNorm, self).__init__(name=name)
         self.epsilon = 1e-5
 
     def build(self, input_shape):
         self.rho = self.add_weight(
             name='rho',
             shape=input_shape[-1],
-            initializer=tf.constant_initializer(0.9),
+            initializer=tf.constant_initializer(0.0),
             trainable=True,
-            constraint=constraints.MinMaxNorm(0.0, 1.0))
+            constraint=keras.constraints.MinMaxNorm(0.0, 1.0))
         self.gamma = self.add_weight(
             name='gamma',
             shape=input_shape[-1],
@@ -85,26 +78,46 @@ class LayerInsNorm(layers.Layer):
     def call(self, x):
         ins_mean, ins_sigma = tf.nn.moments(x, axes=[1, 2], keepdims=True)
         x_ins = (x - ins_mean) / (tf.sqrt(ins_sigma + self.epsilon))
-
         ln_mean, ln_sigma = tf.nn.moments(x, axes=[1, 2, 3], keepdims=True)
         x_ln = (x - ln_mean) / (tf.sqrt(ln_sigma + self.epsilon))
-
         x_hat = self.rho * x_ins + (1 - self.rho) * x_ln
         return x_hat * self.gamma + self.beta
 
 
-class FullyConnectedWithWeight(tf.keras.layers.Layer):
-    def __init__(self, use_bias=True):
-        super().__init__()
+def spectral_norm(w, iteration=1):
+    init = tf.random_normal_initializer()
+    w_shape = w.shape
+    w = tf.reshape(w, [-1, w_shape[-1]])
+    u = tf.Variable(initial_value=init(shape=[1, w_shape[-1]]), name='u',
+                    trainable=False)
+    u_hat = u
+    v_hat = None
+    for i in range(iteration):
+        v_ = tf.matmul(u_hat, tf.transpose(w))
+        v_hat = tf.nn.l2_normalize(v_)
+        u_ = tf.matmul(v_hat, w)
+        u_hat = tf.nn.l2_normalize(u_)
+    u_hat = tf.stop_gradient(u_hat)
+    v_hat = tf.stop_gradient(v_hat)
+    sigma = tf.matmul(tf.matmul(v_hat, w), tf.transpose(u_hat))
+    with tf.control_dependencies([u.assign(u_hat)]):
+        w_norm = w / sigma
+        w_norm = tf.reshape(w_norm, w_shape)
+    return w_norm
+
+
+class CAM(keras.layers.Layer):
+    def __init__(self, use_bias=True, sn=False, name=None):
+        super(CAM, self).__init__(name=name)
         self.use_bias = use_bias
+        self.sn = sn
 
     def build(self, input_shape):
         self.weight = self.add_weight(
             name='weight',
             shape=[input_shape[-1], 1],
-            # initializer=tf.constant_initializer(0.01),
-            initializer=tf.random_normal_initializer(0.0, 0.02),
-            regularizer=tf.keras.regularizers.l2(0.0001),
+            initializer=weight_initializer,
+            regularizer=weight_regularizer,
             trainable=True)
         self.bias = self.add_weight(
             name='bias',
@@ -112,141 +125,43 @@ class FullyConnectedWithWeight(tf.keras.layers.Layer):
             initializer='zero',
             trainable=True)
 
-    def call(self, x):
+    def call(self, inputs):
+        gap = tf.reduce_mean(inputs, axis=[1, 2])   # global_avg_pooling
+        gmp = tf.reduce_max(inputs, axis=[1, 2])    # global_max_pooling
+        if self.sn:
+            self.weight = spectral_norm(self.weight)
         if self.use_bias:
-            result = tf.matmul(x, self.weight) + self.bias
-            weights = tf.gather(tf.transpose(self.weight+self.bias), 0)
+            cam_gap_logit = tf.matmul(gap, self.weight) + self.bias
+            cam_gap_weight = tf.gather(tf.transpose(self.weight + self.bias), 0)
+            cam_gmp_logit = tf.matmul(gmp, self.weight) + self.bias
+            cam_gmp_weight = tf.gather(tf.transpose(self.weight + self.bias), 0)
         else:
-            result = tf.matmul(x, self.weight)
-            weights = tf.gather(tf.transpose(self.weight), 0)
-        return result, weights
-
-
-def conv(filters, kernel, strides, padding='same', use_bias=True):
-    return tf.keras.layers.Conv2D(
-        filters, kernel, strides, padding=padding, use_bias=use_bias,
-        # kernel_initializer=tf.constant_initializer(0.01),
-        kernel_initializer=tf.random_normal_initializer(0., 0.02),
-        kernel_regularizer=tf.keras.regularizers.l2(0.0001))
-
-
-def dconv(filters, kernel, strides, padding='same', use_bias=True):
-    return tf.keras.layers.Conv2DTranspose(
-        filters, kernel, strides, padding=padding, use_bias=use_bias,
-        activation='tanh',
-        # kernel_initializer=tf.constant_initializer(0.01),
-        kernel_initializer=tf.random_normal_initializer(0., 0.02),
-        kernel_regularizer=tf.keras.regularizers.l2(0.0001))
-
-
-class DownSample(tf.keras.Model):
-    def __init__(self, filters, size, strides, relu_type='relu',
-                 apply_norm=True, use_bias=True):
-        super().__init__()
-        self.conv = conv(filters, size, strides, use_bias=use_bias)
-        self.relu_type = relu_type
-        self.apply_norm = apply_norm
-        self.i_n = InstanceNormalization()
-
-    def call(self, x_init):
-        x = self.conv(x_init)
-        if self.apply_norm:
-            x = self.i_n(x)
-        if self.relu_type.lower() == 'relu':
-            return tf.nn.relu(x)
-        elif self.relu_type.lower() == 'lrelu':
-            return tf.nn.leaky_relu(x, 0.2)
-        else:
-            return x
-
-
-class UpSample(tf.keras.Model):
-    def __init__(self, filters, size, strides, use_bias=True):
-        super().__init__()
-        self.dconv = dconv(filters, size, strides, use_bias=use_bias)
-        self.lin = LayerInsNorm()
-
-    def call(self, x_init):
-        x = self.dconv(x_init)
-        x = self.lin(x)
-        return tf.nn.relu(x)
-
-
-class ResidualNetwork(tf.keras.Model):
-    def __init__(self, filters, use_bias=True):
-        super().__init__()
-        self.part1 = DownSample(filters, 3, 1, use_bias=use_bias)
-        self.part2 = DownSample(filters, 3, 1, relu_type='none', use_bias=use_bias)
-
-    def call(self, x_init):
-        x = self.part1(x_init)
-        x = self.part2(x)
-        return x + x_init
-
-
-class AdaILResblock(tf.keras.Model):
-    def __init__(self, filters, use_bias=True):
-        super().__init__()
-        self.conv1 = conv(filters, 3, 1, use_bias=use_bias)
-        self.adailn1 = AdaInsLayerNorm()
-        self.conv2 = conv(filters, 3, 1, use_bias=use_bias)
-        self.adailn2 = AdaInsLayerNorm()
-    
-    def call(self, x_init, gamma, beta):
-        x = self.conv1(x_init)
-        x = self.adailn1(x, gamma, beta)
-        x = tf.nn.relu(x)
-        x = self.conv2(x)
-        x = self.adailn2(x, gamma, beta)
-        return x + x_init
-
-
-class MultilayerPerceptron(tf.keras.Model):
-    def __init__(self, units, light=True, use_bias=True):
-        super().__init__()
-        self.units = units
-        self.light = light
-        self.gap = layers.GlobalAveragePooling2D()
-        self.flatten = layers.Flatten()
-        self.dense1 = layers.Dense(units, activation='relu', use_bias=use_bias)
-        self.dense2 = layers.Dense(units, activation='relu', use_bias=use_bias)
-        self.dense_g = layers.Dense(units, use_bias=use_bias)
-        self.dense_b = layers.Dense(units, use_bias=use_bias)
-
-    def call(self, x_init):
-        if self.light:
-            x = self.gap(x_init)
-        else:
-            x = self.flatten(x_init)
-        x = self.dense1(x)
-        x = self.dense2(x)
-        gamma = self.dense_g(x)
-        beta = self.dense_b(x)
-        gamma = tf.reshape(gamma, shape=[1, 1, 1, self.units])
-        beta = tf.reshape(beta, shape=[1, 1, 1, self.units])
-        return gamma, beta
+            cam_gap_logit = tf.matmul(gap, self.weight)
+            cam_gap_weight = tf.gather(tf.transpose(self.weight), 0)
+            cam_gmp_logit = tf.matmul(gmp, self.weight)
+            cam_gmp_weight = tf.gather(tf.transpose(self.weight), 0)
+        x_gap = tf.multiply(inputs, cam_gap_weight)
+        x_gmp = tf.multiply(inputs, cam_gmp_weight)
+        cam_logit = tf.concat([cam_gap_logit, cam_gmp_logit], axis=-1)
+        outputs = tf.concat([x_gap, x_gmp], axis=-1)
+        return cam_logit, outputs
 
 
 def L1_loss(x, y):
-    loss = tf.reduce_mean(tf.abs(x - y))
-    return loss
+    return tf.reduce_mean(tf.abs(x - y))
 
 
 def cam_loss(source, non_source):
-    identity_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-        tf.ones_like(source), source))
-    non_identity_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-        tf.zeros_like(non_source), non_source))
+    identity_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(tf.ones_like(source), source))
+    non_identity_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(tf.zeros_like(non_source), non_source))
     return identity_loss + non_identity_loss
 
 
 def discriminator_loss(real, fake):
     loss = []
     for i in range(2):
-        real_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-            tf.ones_like(real[i]), real[i]))
-        fake_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-            tf.zeros_like(fake[i]), fake[i]))
+        real_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(tf.ones_like(real[i]), real[i]))
+        fake_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(tf.zeros_like(fake[i]), fake[i]))
         loss.append(real_loss + fake_loss)
     return sum(loss)
 
@@ -254,39 +169,6 @@ def discriminator_loss(real, fake):
 def generator_loss(fake):
     loss = []
     for i in range(2):
-        fake_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-            tf.ones_like(fake[i]), fake[i]))
+        fake_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(tf.ones_like(fake[i]), fake[i]))
         loss.append(fake_loss)
     return sum(loss)
-
-
-def plot_images(test_images, models):
-    to_zebra, _, _ = models[0](test_images[0])
-    to_horse, _, _ = models[1](test_images[1])
-    plt.figure(figsize=(10, 10))
-    contrast = 1
-    images = [test_images[0], to_zebra, test_images[1], to_horse]
-    title = ['Horse', 'To Zebra', 'Zebra', 'To Horse']
-    for i in range(len(images)):
-        plt.subplot(2, 2, i + 1)
-        plt.title(title[i])
-        if i % 2 == 0:
-            plt.imshow(images[i][0] * 0.5 + 0.5)
-        else:
-            plt.imshow(images[i][0] * 0.5 * contrast + 0.5)
-    plt.show()
-
-
-def normalize(image, label):
-    image = tf.cast(image, tf.float32)
-    image = (image / 127.5) - 1
-    return image
-
-
-def preprocess_image_train(image, label):
-    image = tf.image.resize(image, [286, 286],
-                            method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-    image = tf.image.random_crop(image, size=[256, 256, 3])
-    image = tf.image.random_flip_left_right(image)
-    image = normalize(image, label)
-    return image
