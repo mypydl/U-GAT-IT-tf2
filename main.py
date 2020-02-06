@@ -105,8 +105,8 @@ class UGATIT:
             x_bb, cam_bb, _ = self.gen_a2b(domain_B)
             real_A_logit, real_A_cam_logit, _, _ = self.dis_a(domain_A, training=False)
             real_B_logit, real_B_cam_logit, _, _ = self.dis_b(domain_B, training=False)
-            fake_A_logit, fake_A_cam_logit, _, _ = self.dis_b(x_ab)
-            fake_B_logit, fake_B_cam_logit, _, _ = self.dis_a(x_ba)
+            fake_A_logit, fake_A_cam_logit, _, _ = self.dis_a(x_ba)
+            fake_B_logit, fake_B_cam_logit, _, _ = self.dis_b(x_ab)
 
             """ Define Loss """
             G_ad_loss_A = generator_loss(fake_A_logit) + generator_loss(fake_A_cam_logit)
