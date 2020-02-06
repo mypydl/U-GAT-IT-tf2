@@ -12,8 +12,10 @@ from datetime import datetime
 import time
 import matplotlib.pyplot as plt
 
+# 想用GPU跑就注释掉下面两行
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 tf.config.experimental_run_functions_eagerly(True)
 tfds.disable_progress_bar()
 # gpus = tf.config.experimental.list_physical_devices(device_type='GPU')
